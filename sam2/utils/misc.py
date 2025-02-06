@@ -7,11 +7,14 @@
 import os
 import warnings
 from threading import Thread
+from typing import TypeGuard, TypeVar
 
 import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+
+T = TypeVar("T")
 
 
 def get_sdpa_settings():
@@ -204,6 +207,15 @@ def load_video_frames(
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+    elif is_numpy_list(video_path) or is_tensor_list(video_path):
+        return normalize_loaded_frames(
+            image_list=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            compute_device=compute_device,
+        )
     else:
         raise NotImplementedError(
             "Only MP4 video and JPEG folder are supported at this moment"
@@ -288,8 +300,6 @@ def load_video_frames_from_video_file(
     """Load the video frames from a video file."""
     import decord
 
-    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
     # Get the original video height and width
     decord.bridge.set_bridge("torch")
     video_height, video_width, _ = decord.VideoReader(video_path).next().shape
@@ -298,7 +308,62 @@ def load_video_frames_from_video_file(
     for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
         images.append(frame.permute(2, 0, 1))
 
-    images = torch.stack(images, dim=0).float() / 255.0
+    image_tensor, _, _ = normalize_loaded_frames(
+        images, image_size, offload_video_to_cpu, img_mean, img_std, compute_device
+    )
+    return image_tensor, video_height, video_width
+
+
+def is_numpy_list(val: object) -> TypeGuard[list[np.ndarray]]:
+    return isinstance(val, list) and all(isinstance(x, np.ndarray) for x in val)
+
+
+def is_tensor_list(val: object) -> TypeGuard[list[torch.Tensor]]:
+    return isinstance(val, list) and all(isinstance(x, torch.Tensor) for x in val)
+
+
+def normalize_loaded_frames(
+    image_list: list[np.ndarray] | list[torch.Tensor],
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    assert len(image_list) > 0
+
+    if is_numpy_list(image_list):
+        video_height, video_width, channels = image_list[0].shape
+        assert channels == 1 or channels == 3
+
+        if video_height != image_size or video_width != image_size:
+            # Resize images
+            import cv2
+
+            interpolation = (
+                cv2.INTER_AREA if image_size < video_height else cv2.INTER_LINEAR
+            )
+
+            image_list = [
+                cv2.resize(x, (image_size, image_size), interpolation=interpolation)
+                for x in image_list
+            ]
+        # Permute and torch
+        image_list = [torch.from_numpy(x).permute(2, 0, 1) for x in image_list]
+    else:
+        _, video_height, video_width = image_list[0].shape
+        # No resizing supported for tensors
+
+    assert is_tensor_list(image_list)
+    channels, tensor_height, tensor_width = image_list[0].shape
+    assert channels == 1 or channels == 3
+    assert tensor_height == image_size
+    assert tensor_width == image_size
+
+    images = torch.stack(image_list, dim=0).float() / 255.0
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
